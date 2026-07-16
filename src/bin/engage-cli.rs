@@ -1,6 +1,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -50,6 +51,12 @@ struct Create {
     recipient: Vec<String>,
     #[arg(long, conflicts_with = "recipient")]
     passphrase: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Maximum compression workers; defaults to min(5, available CPUs minus one)"
+    )]
+    threads: Option<NonZeroUsize>,
 }
 
 #[derive(Args)]
@@ -145,7 +152,10 @@ fn create(args: Create) -> engage::Result<()> {
         args.inputs,
         args.output,
         &credential,
-        CreateOptions::default(),
+        CreateOptions {
+            compression_threads: args.threads.map(NonZeroUsize::get),
+            ..CreateOptions::default()
+        },
     )
 }
 
@@ -282,6 +292,40 @@ mod tests {
             "--recipient",
             "age1pq-recipient",
             "--passphrase",
+            "input.txt",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_accepts_positive_compression_thread_count() {
+        let cli = Cli::try_parse_from([
+            "engage-cli",
+            "create",
+            "--output",
+            "archive.engage",
+            "--passphrase",
+            "--threads",
+            "4",
+            "input.txt",
+        ])
+        .unwrap();
+        let Command::Create(create) = cli.command else {
+            panic!("expected create command");
+        };
+        assert_eq!(create.threads.map(NonZeroUsize::get), Some(4));
+    }
+
+    #[test]
+    fn create_rejects_zero_compression_threads() {
+        let result = Cli::try_parse_from([
+            "engage-cli",
+            "create",
+            "--output",
+            "archive.engage",
+            "--passphrase",
+            "--threads",
+            "0",
             "input.txt",
         ]);
         assert!(result.is_err());

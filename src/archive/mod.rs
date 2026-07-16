@@ -26,6 +26,7 @@ const INDEX_FRAME_SIZE: u32 = 256 * 1024;
 const BODY_PREFIX_SIZE: usize = 64 * 1024;
 
 mod create;
+mod parallel_zstd;
 mod path;
 
 pub use create::{create_archive, create_archive_controlled, create_archive_with_progress};
@@ -45,6 +46,8 @@ pub enum DecryptCredential {
 pub struct CreateOptions {
     pub sort_memory_bytes: usize,
     pub metadata_segment_bytes: u64,
+    /// Maximum number of compression workers. `None` selects a value from the available CPUs.
+    pub compression_threads: Option<usize>,
 }
 
 impl Default for CreateOptions {
@@ -52,6 +55,7 @@ impl Default for CreateOptions {
         Self {
             sort_memory_bytes: 64 * 1024 * 1024,
             metadata_segment_bytes: DEFAULT_SEGMENT_SIZE,
+            compression_threads: None,
         }
     }
 }

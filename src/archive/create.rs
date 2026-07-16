@@ -9,11 +9,11 @@ use std::{
 
 use eros::Context;
 use tempfile::NamedTempFile;
-use zeekstd::{EncodeOptions, FrameSizePolicy};
 
 use super::{
     BODY_FRAME_SIZE, BODY_PREFIX_SIZE, CreateOptions, EncryptCredential, INDEX_FRAME_SIZE,
     make_encryptor,
+    parallel_zstd::SeekableEncoder,
     path::{metadata_mode, validate_component, validate_link_target},
 };
 use crate::{
@@ -70,6 +70,7 @@ pub fn create_archive_with_progress(
     reporter: &mut dyn FnMut(OperationProgress),
 ) -> Result<()> {
     let destination = destination.as_ref();
+    let compression_thread_limit = compression_thread_limit(&options)?;
     let mut progress = ProgressEmitter::new(reporter);
     progress.set_stage(OperationStage::Scanning, None, None);
     cancellation.checkpoint()?;
@@ -98,11 +99,14 @@ pub fn create_archive_with_progress(
         let mut index = IndexBuilder::new(destination_parent, options.sort_memory_bytes)?;
         let encryptor = make_encryptor(credential)?;
         let mut age_writer = encryptor.wrap_output(output.as_file_mut())?;
-        let body_options = EncodeOptions::new()
-            .compression_level(9)
-            .checksum_flag(true)
-            .frame_size_policy(FrameSizePolicy::Uncompressed(BODY_FRAME_SIZE));
-        let mut zstd = body_options.into_encoder(&mut age_writer)?;
+        let body_workers = body_worker_count(compression_thread_limit, &totals);
+        let mut zstd = SeekableEncoder::new(
+            &mut age_writer,
+            BODY_FRAME_SIZE,
+            1,
+            body_workers,
+            cancellation,
+        )?;
         let counter = CountingWriter::new(&mut zstd);
         let mut tar = tar::Builder::new(counter);
         let mut next_id = 1u64;
@@ -143,7 +147,11 @@ pub fn create_archive_with_progress(
             body_len,
             &mut built,
             credential,
-            options.metadata_segment_bytes,
+            MetadataCompression {
+                segment_size: options.metadata_segment_bytes,
+                input_len: metadata_len,
+                thread_limit: compression_thread_limit,
+            },
             cancellation,
             &mut progress,
         )
@@ -174,23 +182,38 @@ pub fn create_archive_with_progress(
     Ok(())
 }
 
+struct MetadataCompression {
+    segment_size: u64,
+    input_len: u64,
+    thread_limit: usize,
+}
+
 fn append_metadata(
     output: &mut File,
     body_len: u64,
     built: &mut BuiltIndex,
     credential: &EncryptCredential,
-    segment_size: u64,
+    compression: MetadataCompression,
     cancellation: &CancellationToken,
     progress: &mut ProgressEmitter<'_>,
 ) -> Result<()> {
-    let mut segment_writer = SegmentWriter::new(output, body_len, segment_size)?;
+    let mut segment_writer = SegmentWriter::new(output, body_len, compression.segment_size)?;
     let encryptor = make_encryptor(credential)?;
     let mut age_writer = encryptor.wrap_output(&mut segment_writer)?;
-    let options = EncodeOptions::new()
-        .compression_level(9)
-        .checksum_flag(true)
-        .frame_size_policy(FrameSizePolicy::Uncompressed(INDEX_FRAME_SIZE));
-    let mut zstd = options.into_encoder(&mut age_writer)?;
+    let frame_count = compression
+        .input_len
+        .div_ceil(INDEX_FRAME_SIZE as u64)
+        .max(1);
+    let frames_per_job = (BODY_FRAME_SIZE / INDEX_FRAME_SIZE) as usize;
+    let job_count = frame_count.div_ceil(frames_per_job as u64);
+    let workers = compression.thread_limit.min(job_count as usize).max(1);
+    let mut zstd = SeekableEncoder::new(
+        &mut age_writer,
+        INDEX_FRAME_SIZE,
+        frames_per_job,
+        workers,
+        cancellation,
+    )?;
     io::copy(
         &mut MetadataProgressReader::new(built.file.as_file_mut(), cancellation, progress),
         &mut zstd,
@@ -199,6 +222,30 @@ fn append_metadata(
     age_writer.finish()?;
     segment_writer.finish()?;
     Ok(())
+}
+
+fn compression_thread_limit(options: &CreateOptions) -> Result<usize> {
+    if options.compression_threads == Some(0) {
+        return Err(invalid("compression thread count must be at least one"));
+    }
+    Ok(options.compression_threads.unwrap_or_else(|| {
+        automatic_compression_thread_limit(
+            std::thread::available_parallelism().map_or(1, usize::from),
+        )
+    }))
+}
+
+fn automatic_compression_thread_limit(available: usize) -> usize {
+    available.saturating_sub(1).clamp(1, 5)
+}
+
+fn body_worker_count(limit: usize, totals: &InputTotals) -> usize {
+    let estimated_tar_size = totals
+        .bytes
+        .saturating_add(totals.entries.saturating_mul(1024))
+        .saturating_add(1024);
+    let estimated_frames = estimated_tar_size.div_ceil(BODY_FRAME_SIZE as u64).max(1);
+    limit.min(estimated_frames as usize).max(1)
 }
 
 fn validate_inputs(inputs: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
@@ -542,5 +589,19 @@ impl<W: Write> Write for CountingWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::automatic_compression_thread_limit;
+
+    #[test]
+    fn automatic_compression_workers_reserve_one_cpu_and_cap_at_five() {
+        assert_eq!(automatic_compression_thread_limit(1), 1);
+        assert_eq!(automatic_compression_thread_limit(2), 1);
+        assert_eq!(automatic_compression_thread_limit(4), 3);
+        assert_eq!(automatic_compression_thread_limit(6), 5);
+        assert_eq!(automatic_compression_thread_limit(20), 5);
     }
 }
