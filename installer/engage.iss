@@ -1,9 +1,9 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.1.1"
 #endif
 
 #define MyAppName "Engage"
-#define MyAppPublisher "Engage contributors"
+#define MyAppPublisher "Nullpinter"
 #define MyGuiExe "engage.exe"
 #define MyCliExe "engage-cli.exe"
 
