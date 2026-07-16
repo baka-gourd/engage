@@ -1,0 +1,36 @@
+[package]
+name = "age-hpke-pq"
+version = "0.0.6"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Slurp9187/age-pq-workspace"
+description = "Post-quantum hybrid X-Wing KEM (ML-KEM-768 + X25519) with HPKE support."
+
+[features]
+default = ["mlkem768"]
+mlkem768 = ["libcrux-ml-kem/mlkem768"]
+mlkem512 = ["libcrux-ml-kem/mlkem512"]
+mlkem1024 = ["libcrux-ml-kem/mlkem1024"]
+
+[dependencies]
+libcrux-ml-kem = { version = "0.0.8", default-features = false, features = ["mlkem768", "rand"] }
+sha3 = { version = "0.10", default-features = false }
+x25519-dalek = { version = "2.0", default-features = false, features = ["zeroize", "static_secrets"] }
+x448 = "0.6.0"
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+thiserror = "2.0"
+rand = "0.9"
+rand_core = { version = "0.9", features = ["os_rng"] }
+chacha20poly1305 = "0.10"
+aead = { version = "0.5", default-features = false }
+byteorder = "1.5"
+hkdf = "0.12"
+sha2 = "0.10"
+secure-gate = { version = "=0.8.0-rc.10", features = ["rand", "ct-eq"] }
+unicode-ident = ">=1.0, <1.0.23"
+
+[dev-dependencies]
+rand_chacha = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "=1.0.132"
