@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub enum OperationStage {
     Scanning,
     Archiving,
+    BuildingIndex,
     WritingIndex,
     ResolvingSelection,
     Extracting,
@@ -71,6 +72,16 @@ impl<'a> ProgressEmitter<'a> {
 
     pub(crate) fn emit(&mut self) {
         (self.callback)(self.snapshot.clone());
+    }
+
+    pub(crate) fn completed_work(&self) -> (u64, u64) {
+        (self.snapshot.entries_done, self.snapshot.bytes_done)
+    }
+
+    pub(crate) fn set_totals(&mut self, entries: u64, bytes: u64) {
+        self.snapshot.entries_total = Some(entries);
+        self.snapshot.bytes_total = Some(bytes);
+        self.emit();
     }
 
     pub(crate) fn complete(&mut self, entries: u64, bytes: u64) {

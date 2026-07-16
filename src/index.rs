@@ -213,9 +213,30 @@ impl IndexBuilder {
         tar_len: u64,
         body_len: u64,
         body_prefix_hash: [u8; 32],
+        on_progress: &mut dyn FnMut(u64),
     ) -> Result<BuiltIndex> {
         self.spool.as_file_mut().flush()?;
         self.spool.as_file_mut().seek(SeekFrom::Start(0))?;
+
+        if self.spool.as_file().metadata()?.len() <= self.sort_memory as u64 {
+            let mut records = Vec::new();
+            while let Some(record) = read_record(self.spool.as_file_mut())? {
+                records.push(record);
+                on_progress(1);
+            }
+            records.sort_unstable_by_key(EntryRecord::key);
+            let mut records = records.into_iter();
+            return build_page_file(
+                temp_dir,
+                self.count,
+                tar_len,
+                body_len,
+                body_prefix_hash,
+                || Ok(records.next()),
+                on_progress,
+            );
+        }
+
         let mut runs = Vec::new();
         loop {
             let mut records = Vec::new();
@@ -225,6 +246,7 @@ impl IndexBuilder {
                     Some(record) => {
                         bytes += record.encode()?.len() + 4;
                         records.push(record);
+                        on_progress(1);
                     }
                     None => break,
                 }
@@ -241,15 +263,13 @@ impl IndexBuilder {
             runs.push(run);
         }
 
-        let mut page_file = NamedTempFile::new_in(temp_dir)?;
-        page_file.as_file_mut().write_all(&vec![0u8; PAGE_SIZE])?;
         let mut readers: Vec<_> = runs
             .iter_mut()
             .map(|run| {
-                run.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
-                BufReader::new(run.as_file().try_clone().unwrap())
+                run.as_file_mut().seek(SeekFrom::Start(0))?;
+                Ok(BufReader::new(run.as_file().try_clone()?))
             })
-            .collect();
+            .collect::<std::io::Result<_>>()?;
         let mut heap = BinaryHeap::new();
         for (run, reader) in readers.iter_mut().enumerate() {
             if let Some(record) = read_record(reader)? {
@@ -257,125 +277,158 @@ impl IndexBuilder {
             }
         }
 
-        let mut leaf_descriptors = Vec::new();
-        let mut payload = Vec::with_capacity(PAYLOAD_SIZE);
-        let mut first_key = None;
-        let mut leaf_count = 0u32;
-        let mut page_id = 1u64;
-        while let Some(item) = heap.pop() {
-            let run = item.run;
-            let encoded = item.record.encode()?;
-            let needed = 4 + encoded.len();
-            if needed > PAYLOAD_SIZE {
-                return Err(invalid("index record exceeds page size"));
-            }
-            if payload.len() + needed > PAYLOAD_SIZE {
-                write_page(
-                    page_file.as_file_mut(),
-                    page_id,
-                    PAGE_LEAF,
-                    0,
-                    leaf_count,
-                    page_id + 1,
-                    &payload,
-                )?;
-                leaf_descriptors.push((first_key.take().unwrap(), page_id));
-                page_id += 1;
-                payload.clear();
-                leaf_count = 0;
-            }
-            if first_key.is_none() {
-                first_key = Some(item.record.key());
-            }
-            payload.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-            payload.extend_from_slice(&encoded);
-            leaf_count += 1;
-            if let Some(record) = read_record(&mut readers[run])? {
-                heap.push(HeapItem { run, record });
-            }
-        }
-        if first_key.is_none() {
-            first_key = Some(Key {
-                parent_id: 0,
-                name: String::new(),
-            });
-        }
-        write_page(
-            page_file.as_file_mut(),
-            page_id,
-            PAGE_LEAF,
-            0,
-            leaf_count,
-            0,
-            &payload,
-        )?;
-        leaf_descriptors.push((first_key.unwrap(), page_id));
-        page_id += 1;
-
-        let first_leaf = 1u64;
-        let mut level = 1u8;
-        let mut descriptors = leaf_descriptors;
-        while descriptors.len() > 1 {
-            let mut next = Vec::new();
-            let mut cursor = 0;
-            while cursor < descriptors.len() {
-                let first = descriptors[cursor].0.clone();
-                let mut internal = Vec::new();
-                let mut count = 0u32;
-                while cursor < descriptors.len() {
-                    let encoded = encode_internal(&descriptors[cursor]);
-                    if !internal.is_empty() && internal.len() + encoded.len() > PAYLOAD_SIZE {
-                        break;
-                    }
-                    if encoded.len() > PAYLOAD_SIZE {
-                        return Err(invalid("internal index key exceeds page size"));
-                    }
-                    internal.extend_from_slice(&encoded);
-                    count += 1;
-                    cursor += 1;
-                }
-                write_page(
-                    page_file.as_file_mut(),
-                    page_id,
-                    PAGE_INTERNAL,
-                    level,
-                    count,
-                    0,
-                    &internal,
-                )?;
-                next.push((first, page_id));
-                page_id += 1;
-            }
-            descriptors = next;
-            level = level
-                .checked_add(1)
-                .ok_or_else(|| invalid("index tree is too deep"))?;
-        }
-        let root_page = descriptors[0].1;
-        let super_payload = encode_super(Superblock {
-            root_page,
-            first_leaf,
-            page_count: page_id,
-            entry_count: self.count,
+        build_page_file(
+            temp_dir,
+            self.count,
             tar_len,
             body_len,
             body_prefix_hash,
-        });
-        write_page(
-            page_file.as_file_mut(),
-            0,
-            PAGE_SUPER,
-            0,
-            1,
-            0,
-            &super_payload,
-        )?;
-        page_file
-            .as_file_mut()
-            .set_len(page_id * PAGE_SIZE as u64)?;
-        page_file.as_file_mut().flush()?;
-        Ok(BuiltIndex { file: page_file })
+            || {
+                let Some(item) = heap.pop() else {
+                    return Ok(None);
+                };
+                let run = item.run;
+                if let Some(record) = read_record(&mut readers[run])? {
+                    heap.push(HeapItem { run, record });
+                }
+                Ok(Some(item.record))
+            },
+            on_progress,
+        )
     }
+}
+
+fn build_page_file(
+    temp_dir: &Path,
+    expected_count: u64,
+    tar_len: u64,
+    body_len: u64,
+    body_prefix_hash: [u8; 32],
+    mut next_record: impl FnMut() -> Result<Option<EntryRecord>>,
+    on_progress: &mut dyn FnMut(u64),
+) -> Result<BuiltIndex> {
+    let mut page_file = NamedTempFile::new_in(temp_dir)?;
+    page_file.as_file_mut().write_all(&vec![0u8; PAGE_SIZE])?;
+    let mut leaf_descriptors = Vec::new();
+    let mut payload = Vec::with_capacity(PAYLOAD_SIZE);
+    let mut first_key = None;
+    let mut leaf_count = 0u32;
+    let mut page_id = 1u64;
+    let mut actual_count = 0u64;
+    while let Some(record) = next_record()? {
+        let encoded = record.encode()?;
+        let needed = 4 + encoded.len();
+        if needed > PAYLOAD_SIZE {
+            return Err(invalid("index record exceeds page size"));
+        }
+        if payload.len() + needed > PAYLOAD_SIZE {
+            write_page(
+                page_file.as_file_mut(),
+                page_id,
+                PAGE_LEAF,
+                0,
+                leaf_count,
+                page_id + 1,
+                &payload,
+            )?;
+            leaf_descriptors.push((first_key.take().unwrap(), page_id));
+            page_id += 1;
+            payload.clear();
+            leaf_count = 0;
+        }
+        if first_key.is_none() {
+            first_key = Some(record.key());
+        }
+        payload.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&encoded);
+        leaf_count += 1;
+        actual_count += 1;
+        on_progress(1);
+    }
+    if actual_count != expected_count {
+        return Err(invalid("index record count changed while building pages"));
+    }
+    if first_key.is_none() {
+        first_key = Some(Key {
+            parent_id: 0,
+            name: String::new(),
+        });
+    }
+    write_page(
+        page_file.as_file_mut(),
+        page_id,
+        PAGE_LEAF,
+        0,
+        leaf_count,
+        0,
+        &payload,
+    )?;
+    leaf_descriptors.push((first_key.unwrap(), page_id));
+    page_id += 1;
+
+    let first_leaf = 1u64;
+    let mut level = 1u8;
+    let mut descriptors = leaf_descriptors;
+    while descriptors.len() > 1 {
+        let mut next = Vec::new();
+        let mut cursor = 0;
+        while cursor < descriptors.len() {
+            let first = descriptors[cursor].0.clone();
+            let mut internal = Vec::new();
+            let mut count = 0u32;
+            while cursor < descriptors.len() {
+                let encoded = encode_internal(&descriptors[cursor]);
+                if !internal.is_empty() && internal.len() + encoded.len() > PAYLOAD_SIZE {
+                    break;
+                }
+                if encoded.len() > PAYLOAD_SIZE {
+                    return Err(invalid("internal index key exceeds page size"));
+                }
+                internal.extend_from_slice(&encoded);
+                count += 1;
+                cursor += 1;
+            }
+            write_page(
+                page_file.as_file_mut(),
+                page_id,
+                PAGE_INTERNAL,
+                level,
+                count,
+                0,
+                &internal,
+            )?;
+            next.push((first, page_id));
+            page_id += 1;
+        }
+        descriptors = next;
+        level = level
+            .checked_add(1)
+            .ok_or_else(|| invalid("index tree is too deep"))?;
+    }
+    let root_page = descriptors[0].1;
+    let super_payload = encode_super(Superblock {
+        root_page,
+        first_leaf,
+        page_count: page_id,
+        entry_count: expected_count,
+        tar_len,
+        body_len,
+        body_prefix_hash,
+    });
+    write_page(
+        page_file.as_file_mut(),
+        0,
+        PAGE_SUPER,
+        0,
+        1,
+        0,
+        &super_payload,
+    )?;
+    page_file
+        .as_file_mut()
+        .set_len(page_id * PAGE_SIZE as u64)?;
+    page_file.as_file_mut().flush()?;
+    Ok(BuiltIndex { file: page_file })
 }
 
 struct HeapItem {
@@ -811,6 +864,22 @@ fn take_array<const N: usize>(bytes: &mut &[u8]) -> Result<[u8; N]> {
 mod tests {
     use super::*;
 
+    fn test_record(id: u64) -> EntryRecord {
+        EntryRecord {
+            id,
+            parent_id: 0,
+            name: format!("file-{id:05}-{}", "x".repeat(64)),
+            kind: EntryKind::File,
+            tar_offset: id * 512,
+            size: id,
+            mtime: 0,
+            mode: 0o644,
+            hash: [id as u8; 32],
+            link_target: None,
+            link_is_dir: false,
+        }
+    }
+
     #[test]
     fn record_encoding_round_trip() {
         let record = EntryRecord {
@@ -838,5 +907,33 @@ mod tests {
         assert!(error.to_string().contains("count exceeds"));
         let error = decode_leaf_records(&[0; 88], u32::MAX).unwrap_err();
         assert!(error.to_string().contains("count exceeds"));
+    }
+
+    #[test]
+    fn in_memory_and_external_sort_build_identical_indexes_and_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let records = (1..=2_000).rev().map(test_record).collect::<Vec<_>>();
+        let build = |sort_memory, suffix: &str| {
+            let directory = temp.path().join(suffix);
+            std::fs::create_dir(&directory).unwrap();
+            let mut builder = IndexBuilder::new(&directory, sort_memory).unwrap();
+            for record in &records {
+                builder.push(record).unwrap();
+            }
+            let mut progress = 0;
+            let built = builder
+                .finish(&directory, 123, 456, [9; 32], &mut |count| {
+                    progress += count;
+                })
+                .unwrap();
+            let bytes = std::fs::read(built.file.path()).unwrap();
+            (bytes, progress)
+        };
+
+        let (in_memory, in_memory_progress) = build(1024 * 1024, "memory");
+        let (external, external_progress) = build(PAGE_SIZE * 2, "external");
+        assert_eq!(in_memory, external);
+        assert_eq!(in_memory_progress, records.len() as u64 * 2);
+        assert_eq!(external_progress, records.len() as u64 * 2);
     }
 }

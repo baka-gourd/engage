@@ -3,7 +3,8 @@ use std::fs;
 use age::secrecy::SecretString;
 use engage::{
     Archive, CancellationToken, ConflictKind, CreateOptions, DecryptCredential, EncryptCredential,
-    ExtractOptions, Selection, create_archive, create_archive_controlled, generate_pq_keypair,
+    ExtractOptions, OperationProgress, OperationStage, Selection, create_archive,
+    create_archive_controlled, create_archive_with_progress, generate_pq_keypair,
 };
 
 const PASSWORD: &str = "correct horse battery staple";
@@ -14,6 +15,79 @@ fn encrypt_credential() -> EncryptCredential {
 
 fn decrypt_credential() -> DecryptCredential {
     DecryptCredential::Passphrase(SecretString::from(PASSWORD))
+}
+
+#[test]
+fn creation_pipelines_scanning_and_switches_to_determinate_archiving_progress() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("progress-input");
+    fs::create_dir(&input).unwrap();
+    fs::write(input.join("first.txt"), b"first").unwrap();
+    fs::write(input.join("second.txt"), b"second payload").unwrap();
+    let archive_path = temp.path().join("progress.engage");
+    let cancellation = CancellationToken::new();
+    let mut snapshots = Vec::<OperationProgress>::new();
+
+    create_archive_with_progress(
+        vec![input],
+        &archive_path,
+        &encrypt_credential(),
+        CreateOptions::default(),
+        false,
+        &cancellation,
+        &mut |progress| snapshots.push(progress),
+    )
+    .unwrap();
+
+    let stages = snapshots
+        .iter()
+        .map(|item| item.stage)
+        .fold(Vec::new(), |mut stages, stage| {
+            if stages.last() != Some(&stage) {
+                stages.push(stage);
+            }
+            stages
+        });
+    assert_eq!(
+        stages,
+        vec![
+            OperationStage::Scanning,
+            OperationStage::Archiving,
+            OperationStage::BuildingIndex,
+            OperationStage::WritingIndex,
+            OperationStage::Finalizing,
+            OperationStage::Complete,
+        ]
+    );
+    let archiving = snapshots
+        .iter()
+        .find(|item| item.stage == OperationStage::Archiving)
+        .unwrap();
+    assert_eq!(archiving.entries_total, None);
+    assert_eq!(archiving.bytes_total, None);
+    let determinate_archiving = snapshots
+        .iter()
+        .find(|item| {
+            item.stage == OperationStage::Archiving
+                && item.entries_total == Some(3)
+                && item.bytes_total == Some(19)
+        })
+        .expect("scanner totals should make archiving determinate");
+    assert!(determinate_archiving.entries_done < 3 || determinate_archiving.bytes_done < 19);
+
+    let index_progress = snapshots
+        .iter()
+        .filter(|item| item.stage == OperationStage::BuildingIndex)
+        .collect::<Vec<_>>();
+    assert_eq!(index_progress.first().unwrap().entries_total, Some(6));
+    assert_eq!(index_progress.last().unwrap().entries_done, 6);
+
+    let complete = snapshots.last().unwrap();
+    assert_eq!(complete.stage, OperationStage::Complete);
+    assert_eq!(complete.entries_done, 3);
+    assert_eq!(complete.bytes_done, 19);
+    assert_eq!(complete.entries_total, Some(3));
+    assert_eq!(complete.bytes_total, Some(19));
 }
 
 #[test]

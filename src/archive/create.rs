@@ -4,6 +4,12 @@ use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{SyncSender, sync_channel},
+    },
+    thread,
     time::UNIX_EPOCH,
 };
 
@@ -104,44 +110,72 @@ pub fn create_archive_with_progress(
             None
         },
     )?;
-    let totals = scan_inputs(&inputs, &exclusions, cancellation, &mut progress)?;
-    progress.set_stage(
-        OperationStage::Archiving,
-        Some(totals.entries),
-        Some(totals.bytes),
-    );
+    let totals_exclusions = SourceExclusions::new(
+        destination_parent,
+        [output.path(), index.temporary_path()],
+        if overwrite && destination.exists() {
+            Some(destination)
+        } else {
+            None
+        },
+    )?;
+    progress.set_stage(OperationStage::Archiving, None, None);
 
+    let mut completed_totals = (0, 0);
     let staging_result: Result<()> = (|| {
         let encryptor = make_encryptor(credential)?;
         let mut age_writer = encryptor.wrap_output(output.as_file_mut())?;
-        let body_workers = body_worker_count(compression_thread_limit, &totals);
         let mut zstd = SeekableEncoder::new(
             &mut age_writer,
             BODY_FRAME_SIZE,
             1,
-            body_workers,
+            compression_thread_limit,
             cancellation,
         )?;
         let counter = CountingWriter::new(&mut zstd);
         let mut tar = tar::Builder::new(counter);
-        let mut next_id = 1u64;
-        for input in &inputs {
-            let name = input
-                .file_name()
-                .ok_or_else(|| invalid_path(input.display()))?;
-            append_source(
-                &mut tar,
-                &mut index,
-                &exclusions,
-                input,
-                Path::new(name),
-                ROOT_ID,
-                &mut next_id,
-                cancellation,
-                &mut progress,
-            )
-            .with_context(|| format!("adding {}", input.display()))?;
-        }
+        let scan_status = Arc::new(ScanStatus::default());
+        let (entry_tx, entry_rx) = sync_channel(4_096);
+        thread::scope(|scope| -> Result<()> {
+            let totals_status = scan_status.clone();
+            let totals_inputs = inputs.clone();
+            let totals_scanner = scope.spawn(move || {
+                let result = scan_input_totals(&totals_inputs, &totals_exclusions, cancellation);
+                if let Ok(totals) = result {
+                    totals_status.publish(totals);
+                }
+                result
+            });
+            let producer =
+                scope.spawn(move || produce_inputs(&inputs, &exclusions, cancellation, &entry_tx));
+            let consume_result = (|| {
+                while let Ok(entry) = entry_rx.recv() {
+                    let source = entry.source.clone();
+                    append_scanned_entry(
+                        &mut tar,
+                        &mut index,
+                        entry,
+                        cancellation,
+                        &scan_status,
+                        &mut progress,
+                    )
+                    .with_context(|| format!("adding {}", source.display()))?;
+                }
+                cancellation.checkpoint()
+            })();
+            drop(entry_rx);
+            let produce_result = producer
+                .join()
+                .map_err(|_| message("archive scanner panicked"))?;
+            if consume_result.is_err() || produce_result.is_err() {
+                cancellation.cancel();
+            }
+            let _ = totals_scanner.join();
+            consume_result?;
+            produce_result?;
+            scan_status.apply(&mut progress);
+            Ok(())
+        })?;
         cancellation.checkpoint()?;
         tar.finish()?;
         let counter = tar.into_inner()?;
@@ -153,7 +187,32 @@ pub fn create_archive_with_progress(
         let body_prefix_hash = hash_prefix(output.as_file_mut(), body_len)?;
         output.as_file_mut().seek(SeekFrom::Start(body_len))?;
 
-        let mut built = index.finish(destination_parent, tar_len, body_len, body_prefix_hash)?;
+        let archive_totals = progress.completed_work();
+        completed_totals = archive_totals;
+        let index_work = archive_totals
+            .0
+            .checked_mul(2)
+            .ok_or_else(|| invalid("too many index records to report progress"))?;
+        progress.set_stage(OperationStage::BuildingIndex, Some(index_work), None);
+        let mut pending_index_progress = 0u64;
+        let mut reported_index_progress = 0u64;
+        let mut report_index_progress = |records| {
+            pending_index_progress += records;
+            if pending_index_progress >= 256
+                || reported_index_progress + pending_index_progress == index_work
+            {
+                progress.advance(pending_index_progress, 0, None);
+                reported_index_progress += pending_index_progress;
+                pending_index_progress = 0;
+            }
+        };
+        let mut built = index.finish(
+            destination_parent,
+            tar_len,
+            body_len,
+            body_prefix_hash,
+            &mut report_index_progress,
+        )?;
         let metadata_len = built.file.as_file().metadata()?.len();
         built.file.as_file_mut().seek(SeekFrom::Start(0))?;
         cancellation.checkpoint()?;
@@ -194,7 +253,7 @@ pub fn create_archive_with_progress(
             .persist_noclobber(destination)
             .map_err(|error| error.error)?;
     }
-    progress.complete(totals.entries, totals.bytes);
+    progress.complete(completed_totals.0, completed_totals.1);
     Ok(())
 }
 
@@ -255,18 +314,9 @@ fn automatic_compression_thread_limit(available: usize) -> usize {
     available.saturating_sub(1).clamp(1, 5)
 }
 
-fn body_worker_count(limit: usize, totals: &InputTotals) -> usize {
-    let estimated_tar_size = totals
-        .bytes
-        .saturating_add(totals.entries.saturating_mul(1024))
-        .saturating_add(1024);
-    let estimated_frames = estimated_tar_size.div_ceil(BODY_FRAME_SIZE as u64).max(1);
-    limit.min(estimated_frames as usize).max(1)
-}
-
 fn validate_inputs(inputs: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     let mut names = HashSet::new();
-    for (index, input) in inputs.iter().enumerate() {
+    for input in &inputs {
         if !input.exists() && fs::symlink_metadata(input).is_err() {
             return Err(message(format!(
                 "input does not exist: {}",
@@ -283,9 +333,14 @@ fn validate_inputs(inputs: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
                 "input names collide in the archive root: {name}"
             )));
         }
-        if let Some(parent) = inputs.iter().enumerate().find_map(|(other_index, other)| {
-            (index != other_index && input.starts_with(other)).then_some(other)
-        }) {
+    }
+    let mut ordered = inputs.iter().collect::<Vec<_>>();
+    ordered.sort_unstable();
+    for pair in ordered.windows(2) {
+        let [parent, input] = pair else {
+            unreachable!("windows(2) always contains two paths");
+        };
+        if input.starts_with(parent) {
             return Err(message(format!(
                 "nested inputs are not supported: {} is inside {}",
                 input.display(),
@@ -350,62 +405,102 @@ impl SourceExclusions {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Copy)]
 struct InputTotals {
     entries: u64,
     bytes: u64,
 }
 
-fn scan_inputs(
+#[derive(Default)]
+struct ScanStatus {
+    entries: AtomicU64,
+    bytes: AtomicU64,
+    complete: AtomicBool,
+    reported: AtomicBool,
+}
+
+impl ScanStatus {
+    fn publish(&self, totals: InputTotals) {
+        self.entries.store(totals.entries, Ordering::Relaxed);
+        self.bytes.store(totals.bytes, Ordering::Relaxed);
+        self.complete.store(true, Ordering::Release);
+    }
+
+    fn apply(&self, progress: &mut ProgressEmitter<'_>) {
+        if self.complete.load(Ordering::Acquire) && !self.reported.swap(true, Ordering::AcqRel) {
+            progress.set_totals(
+                self.entries.load(Ordering::Relaxed),
+                self.bytes.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+struct ScannedEntry {
+    parent: Arc<Dir>,
+    name_on_disk: OsString,
+    source: PathBuf,
+    archive_path: PathBuf,
+    parent_id: EntryId,
+    id: EntryId,
+}
+
+fn produce_inputs(
     inputs: &[PathBuf],
     exclusions: &SourceExclusions,
     cancellation: &CancellationToken,
-    progress: &mut ProgressEmitter<'_>,
-) -> Result<InputTotals> {
-    let mut totals = InputTotals::default();
+    sender: &SyncSender<ScannedEntry>,
+) -> Result<()> {
+    let mut next_id = 1;
     for input in inputs {
         let (parent, name) = open_parent(input)?;
-        scan_source(
-            &parent,
-            &name,
-            input,
+        let archive_path = PathBuf::from(&name);
+        produce_source(
+            Arc::new(parent),
+            name,
+            input.clone(),
+            archive_path,
+            ROOT_ID,
+            &mut next_id,
             exclusions,
             cancellation,
-            progress,
-            &mut totals,
+            sender,
         )?;
     }
-    Ok(totals)
+    Ok(())
 }
 
-fn scan_source(
-    parent: &Dir,
-    name: &OsStr,
-    source: &Path,
+#[allow(clippy::too_many_arguments)]
+fn produce_source(
+    parent: Arc<Dir>,
+    name_on_disk: OsString,
+    source: PathBuf,
+    archive_path: PathBuf,
+    parent_id: EntryId,
+    next_id: &mut EntryId,
     exclusions: &SourceExclusions,
     cancellation: &CancellationToken,
-    progress: &mut ProgressEmitter<'_>,
-    totals: &mut InputTotals,
+    sender: &SyncSender<ScannedEntry>,
 ) -> Result<()> {
     cancellation.checkpoint()?;
-    let metadata = parent.symlink_metadata(name)?;
-    let bytes = if metadata.is_file() {
-        open_file_nofollow(parent, name)?.metadata()?.len()
-    } else {
-        0
-    };
-    totals.entries = totals
-        .entries
+    let metadata = parent.symlink_metadata(&name_on_disk)?;
+    let id = *next_id;
+    *next_id = next_id
         .checked_add(1)
         .ok_or_else(|| invalid("too many archive entries"))?;
-    totals.bytes = totals
-        .bytes
-        .checked_add(bytes)
-        .ok_or_else(|| invalid("archive input size overflow"))?;
-    progress.advance(1, bytes, Some(source.to_path_buf()));
+    sender
+        .send(ScannedEntry {
+            parent: parent.clone(),
+            name_on_disk: name_on_disk.clone(),
+            source: source.clone(),
+            archive_path: archive_path.clone(),
+            parent_id,
+            id,
+        })
+        .map_err(|_| message("archive consumer stopped"))?;
 
     if metadata.is_dir() {
-        let directory = parent.open_dir_nofollow(name)?;
+        let directory = Arc::new(parent.open_dir_nofollow(&name_on_disk)?);
         let mut children = directory.entries()?.collect::<io::Result<Vec<_>>>()?;
         children.sort_by_key(cap_std::fs::DirEntry::file_name);
         for child in children {
@@ -413,73 +508,97 @@ fn scan_source(
             if exclusions.skips_directory_entry(&directory, &child_name)? {
                 continue;
             }
-            scan_source(
-                &directory,
-                &child_name,
-                &source.join(&child_name),
+            let archive_child_name = child_name
+                .to_str()
+                .ok_or_else(|| invalid_path(source.join(&child_name).display()))?
+                .to_owned();
+            produce_source(
+                directory.clone(),
+                child_name.clone(),
+                source.join(&child_name),
+                archive_path.join(archive_child_name),
+                id,
+                next_id,
                 exclusions,
                 cancellation,
-                progress,
-                totals,
+                sender,
             )?;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn append_source<W: Write>(
-    tar: &mut tar::Builder<CountingWriter<W>>,
-    index: &mut IndexBuilder,
+fn scan_input_totals(
+    inputs: &[PathBuf],
     exclusions: &SourceExclusions,
-    source: &Path,
-    archive_path: &Path,
-    parent_id: EntryId,
-    next_id: &mut EntryId,
     cancellation: &CancellationToken,
-    progress: &mut ProgressEmitter<'_>,
-) -> Result<()> {
-    let (parent, name) = open_parent(source)?;
-    append_source_at(
-        tar,
-        index,
-        exclusions,
-        &parent,
-        &name,
-        source,
-        archive_path,
-        parent_id,
-        next_id,
-        cancellation,
-        progress,
-    )
+) -> Result<InputTotals> {
+    let mut totals = InputTotals {
+        entries: 0,
+        bytes: 0,
+    };
+    for input in inputs {
+        let (parent, name) = open_parent(input)?;
+        scan_source_totals(&parent, &name, exclusions, cancellation, &mut totals)?;
+    }
+    Ok(totals)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn append_source_at<W: Write>(
-    tar: &mut tar::Builder<CountingWriter<W>>,
-    index: &mut IndexBuilder,
-    exclusions: &SourceExclusions,
+fn scan_source_totals(
     parent: &Dir,
     name_on_disk: &OsStr,
-    source: &Path,
-    archive_path: &Path,
-    parent_id: EntryId,
-    next_id: &mut EntryId,
+    exclusions: &SourceExclusions,
     cancellation: &CancellationToken,
-    progress: &mut ProgressEmitter<'_>,
+    totals: &mut InputTotals,
 ) -> Result<()> {
     cancellation.checkpoint()?;
     let metadata = parent.symlink_metadata(name_on_disk)?;
+    totals.entries = totals
+        .entries
+        .checked_add(1)
+        .ok_or_else(|| invalid("too many archive entries"))?;
+    if metadata.is_file() {
+        totals.bytes = totals
+            .bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| invalid("archive input size overflow"))?;
+    } else if metadata.is_dir() {
+        let directory = parent.open_dir_nofollow(name_on_disk)?;
+        for child in directory.entries()? {
+            let child_name = child?.file_name();
+            if exclusions.skips_directory_entry(&directory, &child_name)? {
+                continue;
+            }
+            scan_source_totals(&directory, &child_name, exclusions, cancellation, totals)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_scanned_entry<W: Write>(
+    tar: &mut tar::Builder<CountingWriter<W>>,
+    index: &mut IndexBuilder,
+    entry: ScannedEntry,
+    cancellation: &CancellationToken,
+    scan_status: &ScanStatus,
+    progress: &mut ProgressEmitter<'_>,
+) -> Result<()> {
+    cancellation.checkpoint()?;
+    let ScannedEntry {
+        parent,
+        name_on_disk,
+        source,
+        archive_path,
+        parent_id,
+        id,
+    } = entry;
+    let metadata = parent.symlink_metadata(&name_on_disk)?;
     let name = archive_path
         .file_name()
         .and_then(OsStr::to_str)
         .ok_or_else(|| invalid_path(archive_path.display()))?;
     validate_component(name)?;
-    let id = *next_id;
-    *next_id = next_id
-        .checked_add(1)
-        .ok_or_else(|| invalid("too many archive entries"))?;
     let mtime = metadata
         .modified()
         .ok()
@@ -504,24 +623,23 @@ fn append_source_at<W: Write>(
         link_target: None,
         link_is_dir: false,
     };
-    let mut opened_directory = None;
-
     if file_type.is_file() {
-        let file = open_file_nofollow(parent, name_on_disk)?;
+        let file = open_file_nofollow(&parent, &name_on_disk)?;
         let std_metadata = file.try_clone()?.into_std().metadata()?;
         record.mode = metadata_mode(&std_metadata);
         append_file(
             tar,
             file.into_std(),
-            source,
-            archive_path,
+            &source,
+            &archive_path,
             &std_metadata,
             &mut record,
             cancellation,
+            scan_status,
             progress,
         )?;
     } else if file_type.is_dir() {
-        let directory = parent.open_dir_nofollow(name_on_disk)?;
+        let directory = parent.open_dir_nofollow(&name_on_disk)?;
         let std_metadata = directory.try_clone()?.into_std_file().metadata()?;
         record.mode = metadata_mode(&std_metadata);
         record.kind = EntryKind::Directory;
@@ -530,11 +648,10 @@ fn append_source_at<W: Write>(
         header.set_size(0);
         header.set_entry_type(tar::EntryType::Directory);
         header.set_cksum();
-        tar.append_data(&mut header, archive_path, io::empty())?;
+        tar.append_data(&mut header, &archive_path, io::empty())?;
         record.tar_offset = tar.get_ref().position;
-        opened_directory = Some(directory);
     } else if file_type.is_symlink() {
-        append_symlink(tar, parent, name_on_disk, archive_path, &mut record)?;
+        append_symlink(tar, &parent, &name_on_disk, &archive_path, &mut record)?;
     } else {
         return Err(message(format!(
             "unsupported filesystem entry: {}",
@@ -542,38 +659,8 @@ fn append_source_at<W: Write>(
         )));
     }
     index.push(&record)?;
-    progress.advance(1, 0, Some(source.to_path_buf()));
-
-    if file_type.is_dir() {
-        let directory = opened_directory
-            .as_ref()
-            .ok_or_else(|| invalid("directory handle was not retained"))?;
-        let mut children = directory.entries()?.collect::<io::Result<Vec<_>>>()?;
-        children.sort_by_key(cap_std::fs::DirEntry::file_name);
-        for child in children {
-            let child_name = child.file_name();
-            if exclusions.skips_directory_entry(directory, &child_name)? {
-                continue;
-            }
-            let archive_child_name = child_name
-                .to_str()
-                .ok_or_else(|| invalid_path(source.join(&child_name).display()))?
-                .to_owned();
-            append_source_at(
-                tar,
-                index,
-                exclusions,
-                directory,
-                &child_name,
-                &source.join(&child_name),
-                &archive_path.join(archive_child_name),
-                id,
-                next_id,
-                cancellation,
-                progress,
-            )?;
-        }
-    }
+    scan_status.apply(progress);
+    progress.advance(1, 0, Some(source));
     Ok(())
 }
 
@@ -586,12 +673,14 @@ fn append_file<W: Write>(
     metadata: &fs::Metadata,
     record: &mut EntryRecord,
     cancellation: &CancellationToken,
+    scan_status: &ScanStatus,
     progress: &mut ProgressEmitter<'_>,
 ) -> Result<()> {
     let size = metadata.len();
     let mut reader = HashingReader::new(
         file.take(size),
         cancellation,
+        scan_status,
         progress,
         source.to_path_buf(),
     );
@@ -655,6 +744,7 @@ struct HashingReader<'a, 'b, R> {
     hasher: blake3::Hasher,
     bytes: u64,
     cancellation: &'a CancellationToken,
+    scan_status: &'a ScanStatus,
     progress: &'a mut ProgressEmitter<'b>,
     path: PathBuf,
 }
@@ -663,6 +753,7 @@ impl<'a, 'b, R> HashingReader<'a, 'b, R> {
     fn new(
         inner: R,
         cancellation: &'a CancellationToken,
+        scan_status: &'a ScanStatus,
         progress: &'a mut ProgressEmitter<'b>,
         path: PathBuf,
     ) -> Self {
@@ -671,6 +762,7 @@ impl<'a, 'b, R> HashingReader<'a, 'b, R> {
             hasher: blake3::Hasher::new(),
             bytes: 0,
             cancellation,
+            scan_status,
             progress,
             path,
         }
@@ -684,6 +776,7 @@ impl<R: Read> Read for HashingReader<'_, '_, R> {
         self.hasher.update(&buffer[..read]);
         self.bytes += read as u64;
         if read != 0 {
+            self.scan_status.apply(self.progress);
             self.progress
                 .advance(0, read as u64, Some(self.path.clone()));
         }
@@ -747,7 +840,7 @@ impl<W: Write> Write for CountingWriter<W> {
 
 #[cfg(test)]
 mod tests {
-    use super::automatic_compression_thread_limit;
+    use super::{automatic_compression_thread_limit, validate_inputs};
 
     #[test]
     fn automatic_compression_workers_reserve_one_cpu_and_cap_at_five() {
@@ -756,5 +849,22 @@ mod tests {
         assert_eq!(automatic_compression_thread_limit(4), 3);
         assert_eq!(automatic_compression_thread_limit(6), 5);
         assert_eq!(automatic_compression_thread_limit(20), 5);
+    }
+
+    #[test]
+    fn nested_inputs_are_rejected_after_sorting_regardless_of_input_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let child = parent.join("child.txt");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(&child, b"child").unwrap();
+
+        for inputs in [
+            vec![parent.clone(), child.clone()],
+            vec![child.clone(), parent.clone()],
+        ] {
+            let error = validate_inputs(inputs).unwrap_err();
+            assert!(error.to_string().contains("nested inputs"));
+        }
     }
 }

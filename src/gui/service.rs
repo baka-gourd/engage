@@ -264,11 +264,22 @@ pub(crate) struct CreateRequest {
 pub(crate) fn spawn_create(request: CreateRequest, events: async_channel::Sender<ServiceEvent>) {
     thread::spawn(move || {
         let progress_events = events.clone();
-        let mut reporter = move |progress| {
-            let _ = progress_events.try_send(ServiceEvent::Progress {
+        let mut previous_stage = None;
+        let mut previous_totals = (None, None);
+        let mut reporter = move |progress: OperationProgress| {
+            let totals = (progress.entries_total, progress.bytes_total);
+            let critical = previous_stage != Some(progress.stage) || previous_totals != totals;
+            previous_stage = Some(progress.stage);
+            previous_totals = totals;
+            let event = ServiceEvent::Progress {
                 kind: TaskKind::Create,
                 progress,
-            });
+            };
+            if critical {
+                let _ = progress_events.send_blocking(event);
+            } else {
+                let _ = progress_events.try_send(event);
+            }
         };
         let result = create_archive_with_progress(
             request.inputs,

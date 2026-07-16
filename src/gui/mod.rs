@@ -33,6 +33,7 @@ use gpui_component::{
     progress::Progress,
     radio::RadioGroup,
     scroll::ScrollableElement as _,
+    skeleton::Skeleton,
     spinner::Spinner,
     table::{Table, TableState},
     tree::{TreeItem, TreeState, tree},
@@ -1150,7 +1151,7 @@ impl MainView {
             .active_task
             .as_ref()
             .and_then(|task| task.progress.as_ref());
-        let value = progress.map_or(0., progress_percent);
+        let value = progress.and_then(progress_percent);
         div()
             .px_5()
             .py_3()
@@ -1171,9 +1172,26 @@ impl MainView {
                             .child(progress.map_or_else(|| "正在准备…".into(), progress_label)),
                     )
                     .child(div().flex_1())
-                    .child(format!("{value:.0}%")),
+                    .when_some(value, |this, value| this.child(format!("{value:.0}%")))
+                    .when(value.is_none(), |this| {
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(Spinner::new())
+                                .when_some(progress, |this, progress| {
+                                    this.child(progress_work_label(progress))
+                                }),
+                        )
+                    }),
             )
-            .child(Progress::new().value(value).h_2())
+            .when_some(value, |this, value| {
+                this.child(Progress::new().value(value).h_2())
+            })
+            .when(value.is_none(), |this| {
+                this.child(Skeleton::new().h_2().rounded_full())
+            })
     }
 
     fn render_home(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2181,7 +2199,7 @@ impl MainView {
             .expect("clipboard overlay requires an active task");
         let cancelled = task.cancellation.is_cancelled();
         let progress = task.progress.as_ref();
-        let value = progress.map_or(0., progress_percent);
+        let value = progress.and_then(progress_percent).unwrap_or(0.);
         let label = if cancelled {
             "正在取消复制…".to_owned()
         } else {
@@ -2438,7 +2456,13 @@ fn join_archive_path(parent: &str, name: &str) -> String {
 fn progress_label(progress: &OperationProgress) -> String {
     let stage = match progress.stage {
         OperationStage::Scanning => "扫描",
+        OperationStage::Archiving
+            if progress.entries_total.is_none() && progress.bytes_total.is_none() =>
+        {
+            "扫描并打包"
+        }
         OperationStage::Archiving => "打包",
+        OperationStage::BuildingIndex => "构建索引",
         OperationStage::WritingIndex => "写入索引",
         OperationStage::ResolvingSelection => "解析选择",
         OperationStage::Extracting => "解压",
@@ -2456,15 +2480,41 @@ fn progress_label(progress: &OperationProgress) -> String {
         )
 }
 
-fn progress_percent(progress: &OperationProgress) -> f32 {
+fn progress_percent(progress: &OperationProgress) -> Option<f32> {
     if progress.stage == OperationStage::Complete {
-        return 100.;
+        return Some(100.);
     }
     if let Some(total) = progress.bytes_total.filter(|total| *total > 0) {
-        return progress.bytes_done as f32 * 100. / total as f32;
+        return Some((progress.bytes_done as f32 * 100. / total as f32).clamp(0., 100.));
     }
     if let Some(total) = progress.entries_total.filter(|total| *total > 0) {
-        return progress.entries_done as f32 * 100. / total as f32;
+        return Some((progress.entries_done as f32 * 100. / total as f32).clamp(0., 100.));
     }
-    0.
+    None
+}
+
+fn progress_work_label(progress: &OperationProgress) -> String {
+    if progress.entries_done == 0 && progress.bytes_done == 0 {
+        return "正在准备…".into();
+    }
+    format!(
+        "已处理 {} 项 · {}",
+        progress.entries_done,
+        format_progress_bytes(progress.bytes_done)
+    )
+}
+
+fn format_progress_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024. && unit < UNITS.len() - 1 {
+        value /= 1024.;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
