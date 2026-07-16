@@ -5,7 +5,7 @@ mod preferences;
 mod service;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::mpsc,
 };
@@ -23,11 +23,12 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Root, Selectable as _, Theme, ThemeMode,
-    TitleBar,
+    TitleBar, WindowExt as _,
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     list::ListItem,
+    notification::Notification,
     popover::Popover,
     progress::Progress,
     radio::RadioGroup,
@@ -64,6 +65,13 @@ enum Page {
     Create,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UnlockAttempt {
+    AutomaticKeys,
+    RetriedKeys,
+    Password,
+}
+
 struct ActiveTask {
     kind: TaskKind,
     progress: Option<OperationProgress>,
@@ -94,6 +102,7 @@ pub(crate) struct MainView {
     archive_tx: mpsc::Sender<ArchiveCommand>,
     event_tx: async_channel::Sender<ServiceEvent>,
     archive_path: Option<PathBuf>,
+    unlock_attempts: VecDeque<UnlockAttempt>,
     entries: Vec<EntryInfo>,
     loaded_directories: HashMap<EntryId, Vec<EntryInfo>>,
     directory_paths: HashMap<EntryId, String>,
@@ -123,6 +132,7 @@ pub(crate) struct MainView {
     password: Entity<InputState>,
     password_confirm: Entity<InputState>,
     archive_password: Entity<InputState>,
+    _archive_password_subscription: gpui::Subscription,
     key_name: Entity<InputState>,
     last_layout: Option<(Pixels, Pixels)>,
 }
@@ -139,6 +149,12 @@ impl MainView {
                 .placeholder("此归档的密码")
                 .masked(true)
         });
+        let archive_password_subscription =
+            cx.subscribe(&archive_password, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
         let key_name = cx.new(|cx| InputState::new(window, cx).placeholder("密钥显示名称"));
 
         let (event_tx, event_rx) = async_channel::bounded(128);
@@ -168,11 +184,11 @@ impl MainView {
         });
         let preferences = Preferences::load();
 
-        cx.spawn(async move |view, cx| {
+        cx.spawn_in(window, async move |view, window| {
             while let Ok(event) = event_rx.recv().await {
                 if view
-                    .update(cx, |this, cx| {
-                        this.handle_service_event(event, cx);
+                    .update_in(window, |this, window, cx| {
+                        this.handle_service_event(event, window, cx);
                         cx.notify();
                     })
                     .is_err()
@@ -211,6 +227,7 @@ impl MainView {
             archive_tx,
             event_tx,
             archive_path: None,
+            unlock_attempts: VecDeque::new(),
             entries: Vec::new(),
             loaded_directories: HashMap::new(),
             directory_paths: HashMap::from([(0, String::new())]),
@@ -240,6 +257,7 @@ impl MainView {
             password,
             password_confirm,
             archive_password,
+            _archive_password_subscription: archive_password_subscription,
             key_name,
             last_layout: None,
         };
@@ -261,8 +279,14 @@ impl MainView {
     fn open_archive(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let path = absolute_path(path);
         self.archive_path = Some(path.clone());
+        self.unlock_attempts.clear();
         self.page = Page::Decrypt;
         self.password_required = false;
+        self.archive_password_visible = false;
+        self.archive_password.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.set_masked(true, window, cx);
+        });
         self.entries.clear();
         self.loaded_directories.clear();
         self.directory_paths.clear();
@@ -286,9 +310,13 @@ impl MainView {
             .cloned()
             .collect();
         if let Some(store) = self.key_store.clone() {
-            let _ = self
+            if self
                 .archive_tx
-                .send(ArchiveCommand::OpenWithKeys { path, store, keys });
+                .send(ArchiveCommand::OpenWithKeys { path, store, keys })
+                .is_ok()
+            {
+                self.unlock_attempts.push_back(UnlockAttempt::AutomaticKeys);
+            }
         } else {
             self.password_required = true;
             self.status = "密钥目录不可用，请输入密码".into();
@@ -325,9 +353,10 @@ impl MainView {
         }
     }
 
-    fn handle_service_event(&mut self, event: ServiceEvent, cx: &mut App) {
+    fn handle_service_event(&mut self, event: ServiceEvent, window: &mut Window, cx: &mut App) {
         match event {
             ServiceEvent::ArchiveOpened(entries) => {
+                self.unlock_attempts.pop_front();
                 self.current_parent = 0;
                 self.current_path.clear();
                 self.entries = entries.clone();
@@ -338,6 +367,14 @@ impl MainView {
                 self.status = "归档已打开，可勾选部分内容解压".into();
             }
             ServiceEvent::PasswordRequired(reason) => {
+                match self.unlock_attempts.pop_front() {
+                    Some(UnlockAttempt::RetriedKeys) => window
+                        .push_notification(Notification::error("重新检查后仍未找到可用的私钥"), cx),
+                    Some(UnlockAttempt::Password) => {
+                        window.push_notification(Notification::error("密码错误，请重试"), cx);
+                    }
+                    Some(UnlockAttempt::AutomaticKeys) | None => {}
+                }
                 self.password_required = true;
                 self.status = format!("本地私钥无法解密，请输入归档密码：{reason}");
             }
@@ -995,6 +1032,35 @@ impl MainView {
         }
     }
 
+    fn retry_open_with_keys(&mut self) {
+        let Some(path) = self.archive_path.clone() else {
+            self.status = "没有正在打开的归档".into();
+            return;
+        };
+        let Some(store) = self.key_store.clone() else {
+            self.status = "密钥目录不可用".into();
+            return;
+        };
+
+        self.keys = scan_keys(Some(&store));
+        self.refresh_recipient_selection();
+        let keys = self
+            .keys
+            .iter()
+            .filter(|entry| matches!(entry.state, KeyState::Valid { .. }))
+            .cloned()
+            .collect::<Vec<_>>();
+        let key_count = keys.len();
+        if self
+            .archive_tx
+            .send(ArchiveCommand::OpenWithKeys { path, store, keys })
+            .is_ok()
+        {
+            self.unlock_attempts.push_back(UnlockAttempt::RetriedKeys);
+        }
+        self.status = format!("正在重新检查 {key_count} 个本地私钥…");
+    }
+
     fn refresh_recipient_selection(&mut self) {
         let available = recipient_choices(&self.keys, &self.public_keys)
             .into_iter()
@@ -1584,9 +1650,6 @@ impl MainView {
                         Checkbox::new("preserve-extraction-hierarchy")
                             .label("保留目录层级")
                             .checked(self.preserve_hierarchy)
-                            .border_1()
-                            .border_color(cx.theme().muted_foreground.opacity(0.7))
-                            .rounded_sm()
                             .on_click(move |checked, _, _| {
                                 let _ = hierarchy_events
                                     .try_send(UiEvent::SetPreserveHierarchy(*checked));
@@ -1904,7 +1967,7 @@ impl MainView {
             .pt(px(34.))
             .flex()
             .justify_end()
-            .bg(gpui::black().opacity(0.18))
+            .bg(gpui::black().opacity(0.45))
             .child(panel)
     }
 
@@ -1926,11 +1989,13 @@ impl MainView {
 
     fn render_overlays(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .absolute()
+            .inset_0()
             .when(self.password_required, |this| {
                 this.child(
                     self.modal_card(
                         "需要密码",
-                        "当前用户的私钥无法打开此归档。",
+                        "请将私钥放入密钥文件夹后重新检查，或输入归档密码。",
                         div()
                             .flex()
                             .flex_col()
@@ -1961,32 +2026,64 @@ impl MainView {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .justify_end()
                                     .gap_2()
                                     .child(Button::new("password-cancel").label("取消").on_click(
-                                        cx.listener(|this, _, _, cx| {
+                                        cx.listener(|this, _, window, cx| {
                                             this.password_required = false;
                                             this.page = Page::Home;
+                                            this.status = "已取消打开归档".into();
+                                            this.archive_password.update(cx, |state, cx| {
+                                                state.set_value("", window, cx);
+                                            });
                                             cx.notify();
                                         }),
                                     ))
                                     .child(
-                                        Button::new("password-submit")
-                                            .label("打开")
-                                            .primary()
+                                        Button::new("open-key-directory")
+                                            .label("打开密钥文件夹")
                                             .on_click(cx.listener(|this, _, _, cx| {
+                                                this.open_key_directory();
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("retry-open-with-keys")
+                                            .label("重新检查")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.retry_open_with_keys();
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("password-submit")
+                                            .label("确定")
+                                            .primary()
+                                            .disabled(
+                                                self.archive_password.read(cx).value().is_empty(),
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let password = this
+                                                    .archive_password
+                                                    .read(cx)
+                                                    .value()
+                                                    .to_string();
+                                                if password.is_empty() {
+                                                    return;
+                                                }
                                                 if let Some(path) = this.archive_path.clone() {
-                                                    let password = this
-                                                        .archive_password
-                                                        .read(cx)
-                                                        .value()
-                                                        .to_string();
-                                                    let _ = this.archive_tx.send(
-                                                        ArchiveCommand::OpenWithPassword {
+                                                    if this
+                                                        .archive_tx
+                                                        .send(ArchiveCommand::OpenWithPassword {
                                                             path,
                                                             password: SecretString::from(password),
-                                                        },
-                                                    );
+                                                        })
+                                                        .is_ok()
+                                                    {
+                                                        this.unlock_attempts
+                                                            .push_back(UnlockAttempt::Password);
+                                                    }
                                                     this.status = "正在验证密码…".into();
                                                     cx.notify();
                                                 }
@@ -2099,7 +2196,7 @@ impl MainView {
             .items_center()
             .justify_center()
             .p_4()
-            .bg(cx.theme().background.opacity(0.72))
+            .bg(gpui::black().opacity(0.45))
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
@@ -2152,6 +2249,7 @@ impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport_width = window.viewport_size().width;
         let rem_size = window.rem_size();
+        let notification_layer = Root::render_notification_layer(window, cx);
         if self.last_layout != Some((viewport_width, rem_size)) {
             self.last_layout = Some((viewport_width, rem_size));
             self.table_state.update(cx, |state, cx| {
@@ -2202,10 +2300,14 @@ impl Render for MainView {
             .when(self.settings_open, |this| {
                 this.child(self.render_settings(cx))
             })
-            .child(self.render_overlays(cx))
+            .when(
+                self.password_required || self.pending_extract.is_some(),
+                |this| this.child(self.render_overlays(cx)),
+            )
             .when(self.clipboard_task.is_some(), |this| {
                 this.child(self.render_clipboard_overlay(cx))
             })
+            .when_some(notification_layer, |this, layer| this.child(layer))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.handle_drop(paths, window, cx);
                 cx.notify();
