@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     fs::File,
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
@@ -195,6 +195,10 @@ impl IndexBuilder {
             count: 0,
             sort_memory: sort_memory.max(PAGE_SIZE * 2),
         })
+    }
+
+    pub(crate) fn temporary_path(&self) -> &Path {
+        self.spool.path()
     }
 
     pub(crate) fn push(&mut self, record: &EntryRecord) -> Result<()> {
@@ -486,6 +490,7 @@ fn decode_super(bytes: &[u8]) -> Result<Superblock> {
     })
 }
 
+#[derive(Clone)]
 struct Page {
     kind: u8,
     level: u8,
@@ -538,6 +543,12 @@ impl IndexReader {
             return Err(invalid("index page zero is not a superblock"));
         }
         this.superblock = decode_super(&page.payload)?;
+        if this.superblock.page_count == 0
+            || this.superblock.root_page >= this.superblock.page_count
+            || this.superblock.first_leaf >= this.superblock.page_count
+        {
+            return Err(invalid("index superblock page ID out of range"));
+        }
         Ok(this)
     }
 
@@ -549,7 +560,11 @@ impl IndexReader {
             .checked_mul(PAGE_SIZE as u64)
             .ok_or_else(|| invalid("index page offset overflow"))?;
         self.decoder.set_offset(offset)?;
-        self.decoder.set_offset_limit(offset + PAGE_SIZE as u64)?;
+        self.decoder.set_offset_limit(
+            offset
+                .checked_add(PAGE_SIZE as u64)
+                .ok_or_else(|| invalid("index page end offset overflow"))?,
+        )?;
         let mut bytes = vec![0u8; PAGE_SIZE];
         self.decoder.read_exact(&mut bytes)?;
         if &bytes[..4] != PAGE_MAGIC || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != 1 {
@@ -585,14 +600,26 @@ impl IndexReader {
 
     fn find_leaf(&mut self, target: &Key) -> Result<u64> {
         let mut page_id = self.superblock.root_page;
+        let mut visited = HashSet::new();
+        let mut parent_level = None;
         loop {
-            let page = self.page(page_id)?;
+            if !visited.insert(page_id) || visited.len() as u64 > self.superblock.page_count {
+                return Err(invalid("index tree contains a page cycle"));
+            }
+            let page = self.page(page_id)?.clone();
             if page.kind == PAGE_LEAF {
+                if page.level != 0 {
+                    return Err(invalid("leaf index page has a nonzero level"));
+                }
                 return Ok(page_id);
             }
             if page.kind != PAGE_INTERNAL || page.level == 0 {
                 return Err(invalid("invalid internal index page"));
             }
+            if parent_level.is_some_and(|level| page.level >= level) {
+                return Err(invalid("index tree levels do not decrease"));
+            }
+            parent_level = Some(page.level);
             let entries = decode_internal_entries(&page.payload, page.count)?;
             let mut chosen = entries
                 .first()
@@ -655,8 +682,15 @@ impl IndexReader {
         let mut leaf = cursor.map_or(self.find_leaf(&target)?, |v| v.leaf_page);
         let mut skip = cursor.map_or(0, |v| v.record_index as usize);
         let mut entries = Vec::new();
+        let mut visited = HashSet::new();
         loop {
-            let page = self.page(leaf)?;
+            if !visited.insert(leaf) || visited.len() as u64 > self.superblock.page_count {
+                return Err(invalid("index leaf chain contains a cycle"));
+            }
+            let page = self.page(leaf)?.clone();
+            if page.kind != PAGE_LEAF || page.level != 0 {
+                return Err(invalid("index leaf chain references a non-leaf page"));
+            }
             let records = decode_leaf_records(&page.payload, page.count)?;
             for (idx, record) in records.into_iter().enumerate().skip(skip) {
                 if record.parent_id < parent {
@@ -692,6 +726,10 @@ impl IndexReader {
 }
 
 fn decode_internal_entries(bytes: &[u8], count: u32) -> Result<Vec<(Key, u64)>> {
+    const MIN_ENTRY_SIZE: usize = 8 + 8 + 2;
+    if count as usize > bytes.len() / MIN_ENTRY_SIZE {
+        return Err(invalid("internal index entry count exceeds page payload"));
+    }
     let mut bytes = bytes;
     let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -707,10 +745,20 @@ fn decode_internal_entries(bytes: &[u8], count: u32) -> Result<Vec<(Key, u64)>> 
         bytes = &bytes[len..];
         out.push((Key { parent_id, name }, child));
     }
+    if !bytes.is_empty() {
+        return Err(invalid("internal index page has trailing data"));
+    }
+    if !out.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+        return Err(invalid("internal index keys are not strictly ordered"));
+    }
     Ok(out)
 }
 
 fn decode_leaf_records(bytes: &[u8], count: u32) -> Result<Vec<EntryRecord>> {
+    const MIN_ENTRY_SIZE: usize = 4 + 84;
+    if count as usize > bytes.len() / MIN_ENTRY_SIZE {
+        return Err(invalid("leaf index entry count exceeds page payload"));
+    }
     let mut bytes = bytes;
     let mut out = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -720,6 +768,12 @@ fn decode_leaf_records(bytes: &[u8], count: u32) -> Result<Vec<EntryRecord>> {
         }
         out.push(EntryRecord::decode(&bytes[..len])?);
         bytes = &bytes[len..];
+    }
+    if !bytes.is_empty() {
+        return Err(invalid("leaf index page has trailing data"));
+    }
+    if !out.windows(2).all(|pair| pair[0].key() < pair[1].key()) {
+        return Err(invalid("leaf index records are not strictly ordered"));
     }
     Ok(out)
 }
@@ -776,5 +830,13 @@ mod tests {
         assert_eq!(decoded.id, record.id);
         assert_eq!(decoded.name, record.name);
         assert_eq!(decoded.hash, record.hash);
+    }
+
+    #[test]
+    fn page_counts_are_bounded_before_allocation() {
+        let error = decode_internal_entries(&[0; 18], u32::MAX).unwrap_err();
+        assert!(error.to_string().contains("count exceeds"));
+        let error = decode_leaf_records(&[0; 88], u32::MAX).unwrap_err();
+        assert!(error.to_string().contains("count exceeds"));
     }
 }

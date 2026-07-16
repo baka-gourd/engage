@@ -351,3 +351,85 @@ fn extraction_conflicts_are_reported_before_writing() {
         b"keep until confirmed"
     );
 }
+
+#[test]
+fn output_inside_input_excludes_internal_and_previous_archives() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(&input).unwrap();
+    fs::write(input.join("keep.txt"), b"keep me").unwrap();
+    let archive_path = input.join("inside.engage");
+
+    create_archive(
+        vec![input.clone()],
+        &archive_path,
+        &encrypt_credential(),
+        CreateOptions::default(),
+    )
+    .unwrap();
+    create_archive_controlled(
+        vec![input.clone()],
+        &archive_path,
+        &encrypt_credential(),
+        CreateOptions::default(),
+        true,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+
+    let mut archive = Archive::open(&archive_path, decrypt_credential(), 64 * 1024).unwrap();
+    let root = archive.list_children(0, None, 16).unwrap();
+    assert_eq!(root.entries.len(), 1);
+    let children = archive.list_children(root.entries[0].id, None, 16).unwrap();
+    assert_eq!(
+        children
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["keep.txt"]
+    );
+}
+
+#[test]
+fn symlink_ancestor_cannot_create_directories_outside_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input");
+    fs::create_dir_all(input.join("a/b")).unwrap();
+    fs::write(input.join("a/b/file.txt"), b"contained").unwrap();
+    let archive_path = temp.path().join("links.engage");
+    create_archive(
+        vec![input.join("a")],
+        &archive_path,
+        &encrypt_credential(),
+        CreateOptions::default(),
+    )
+    .unwrap();
+
+    let output = temp.path().join("output");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&output).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let link = output.join("a");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_dir(&outside, &link) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+        panic!("failed to create test symlink: {error}");
+    }
+
+    let mut archive = Archive::open(&archive_path, decrypt_credential(), 64 * 1024).unwrap();
+    assert!(
+        archive
+            .extract(
+                &output,
+                Selection::Paths(vec!["a/b/file.txt".into()]),
+                ExtractOptions::default(),
+            )
+            .is_err()
+    );
+    assert!(!outside.join("b").exists());
+}

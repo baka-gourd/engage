@@ -10,14 +10,18 @@ age-hpke-pq = { path = "vendor/age-hpke-pq" }
 base64 = "0.22"
 bech32 = "0.12"
 blake3 = "1.8"
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 clap = { version = "4.6", features = ["derive"] }
 crc32fast = "1.5"
 dirs = "6.0"
 eros = "0.6"
 filetime = "0.2"
 rpassword = "7.5"
+same-file = "1.0"
 tar = "0.4.46"
 tempfile = "3.27"
+uuid = { version = "1", features = ["v4"] }
 zeekstd = "0.6.2"
 zeroize = "1.9"
 

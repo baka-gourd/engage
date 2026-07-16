@@ -7,11 +7,10 @@ use std::{
 
 use age::{Decryptor, Encryptor, Identity, Recipient, secrecy::SecretString};
 use eros::Context;
-use tempfile::NamedTempFile;
 
 use crate::{
     CancellationToken, HybridIdentity, HybridRecipient, OperationProgress, OperationStage, Result,
-    error::{invalid, not_found},
+    error::{invalid, invalid_path, not_found},
     format::{DEFAULT_SEGMENT_SIZE, FileRegion, SegmentedReader},
     index::{
         EntryId, EntryKind, EntryPage, EntryRecord, IndexCursor, IndexReader, ROOT_ID, ReadSeek,
@@ -310,8 +309,7 @@ impl Archive {
         let mut progress = ProgressEmitter::new(reporter);
         progress.set_stage(OperationStage::ResolvingSelection, None, None);
         cancellation.checkpoint()?;
-        fs::create_dir_all(destination)?;
-        reject_link_ancestors(destination, destination)?;
+        let extraction_root = ExtractionRoot::open_or_create(destination)?;
         let selected =
             self.resolve_selection(selection, options.preserve_hierarchy, cancellation)?;
         let selected_entries = selected.len() as u64;
@@ -320,16 +318,17 @@ impl Archive {
             .filter(|(record, _)| record.kind == EntryKind::File)
             .try_fold(0u64, |total, (record, _)| total.checked_add(record.size))
             .ok_or_else(|| invalid("selected content size overflow"))?;
-        preflight_targets(destination, &selected, options.overwrite)
+        let mut preflight_walker = extraction_root.walker()?;
+        preflight_capability(&mut preflight_walker, &selected, options.overwrite)
             .context("checking extraction targets")?;
 
+        let mut directory_walker = extraction_root.walker()?;
         for (_, relative) in selected
             .iter()
             .filter(|(v, _)| v.kind == EntryKind::Directory)
         {
             cancellation.checkpoint()?;
-            let target = safe_target(destination, relative)?;
-            fs::create_dir_all(&target)?;
+            directory_walker.directory(relative, true)?;
         }
 
         cancellation.checkpoint()?;
@@ -342,12 +341,11 @@ impl Archive {
             Some(selected_entries),
             Some(selected_bytes),
         );
+        let mut file_walker = extraction_root.walker()?;
         for (record, relative) in selected.iter().filter(|(v, _)| v.kind == EntryKind::File) {
             cancellation.checkpoint()?;
-            let target = safe_target(destination, relative)?;
-            let parent = target.parent().unwrap_or(destination);
-            fs::create_dir_all(parent)?;
-            reject_link_ancestors(destination, parent)?;
+            let (parent_path, name) = split_parent_name(relative)?;
+            let parent = file_walker.directory(parent_path, true)?;
             decoder.set_offset(record.tar_offset)?;
             decoder.set_offset_limit(
                 record
@@ -355,7 +353,7 @@ impl Archive {
                     .checked_add(record.size)
                     .ok_or_else(|| invalid("file offset overflow"))?,
             )?;
-            let mut temp = NamedTempFile::new_in(parent)?;
+            let mut temp = ScopedTempFile::new(parent)?;
             let mut hasher = blake3::Hasher::new();
             let mut written = 0u64;
             let mut buffer = [0u8; 64 * 1024];
@@ -366,7 +364,7 @@ impl Archive {
                 if read == 0 {
                     return Err(invalid("selected file data is truncated"));
                 }
-                temp.write_all(&buffer[..read])?;
+                temp.file_mut().write_all(&buffer[..read])?;
                 hasher.update(&buffer[..read]);
                 written += read as u64;
                 progress.advance(0, read as u64, Some(relative.clone()));
@@ -377,17 +375,10 @@ impl Archive {
                     relative.display()
                 )));
             }
-            temp.as_file_mut().sync_all()?;
+            temp.sync_all()?;
             cancellation.checkpoint()?;
-            match options.overwrite {
-                OverwritePolicy::Refuse => temp
-                    .persist_noclobber(&target)
-                    .map_err(|error| error.error)?,
-                OverwritePolicy::ReplaceFiles => {
-                    temp.persist(&target).map_err(|error| error.error)?
-                }
-            };
-            apply_metadata(&target, record)?;
+            temp.apply_metadata(record)?;
+            temp.persist(name, options.overwrite)?;
             progress.advance(1, 0, Some(relative.clone()));
         }
 
@@ -396,21 +387,20 @@ impl Archive {
             Some(selected_entries),
             None,
         );
+        let mut symlink_walker = extraction_root.walker()?;
         for (record, relative) in selected
             .iter()
             .filter(|(v, _)| v.kind == EntryKind::Symlink)
         {
             cancellation.checkpoint()?;
-            let target = safe_target(destination, relative)?;
-            let parent = target.parent().unwrap_or(destination);
-            fs::create_dir_all(parent)?;
-            reject_link_ancestors(destination, parent)?;
+            let (parent_path, name) = split_parent_name(relative)?;
+            let parent = symlink_walker.directory(parent_path, true)?;
             let link = record
                 .link_target
                 .as_deref()
                 .ok_or_else(|| invalid("symlink record has no target"))?;
             validate_link_target(relative, link)?;
-            create_symlink(link, &target, record.link_is_dir)?;
+            create_symlink_at(parent, link, name, record.link_is_dir)?;
             progress.advance(1, 0, Some(relative.clone()));
         }
 
@@ -419,9 +409,11 @@ impl Archive {
             .filter(|(record, _)| record.kind == EntryKind::Directory)
             .collect();
         directories.sort_by_key(|(_, path)| std::cmp::Reverse(path.components().count()));
+        let mut metadata_walker = extraction_root.walker()?;
         for (record, relative) in directories {
             cancellation.checkpoint()?;
-            apply_metadata(&safe_target(destination, relative)?, record)?;
+            let dir = metadata_walker.directory(relative, false)?;
+            apply_directory_metadata(dir, record)?;
             progress.advance(1, 0, Some(relative.clone()));
         }
         progress.set_stage(OperationStage::Finalizing, None, None);
@@ -481,14 +473,7 @@ impl Archive {
         out: &mut Vec<(EntryRecord, PathBuf)>,
         cancellation: &CancellationToken,
     ) -> Result<()> {
-        cancellation.checkpoint()?;
-        let id = record.id;
-        let recurse = record.kind == EntryKind::Directory;
-        out.push((record, path.clone()));
-        if recurse {
-            self.collect_children(id, path, out, cancellation)?;
-        }
-        Ok(())
+        self.collect_stack(vec![(record, path)], out, cancellation)
     }
 
     fn collect_children(
@@ -498,20 +483,109 @@ impl Archive {
         out: &mut Vec<(EntryRecord, PathBuf)>,
         cancellation: &CancellationToken,
     ) -> Result<()> {
+        let mut stack = Vec::new();
+        self.push_children(parent, path, &mut stack, cancellation)?;
+        self.collect_stack(stack, out, cancellation)
+    }
+
+    fn collect_stack(
+        &mut self,
+        mut stack: Vec<(EntryRecord, PathBuf)>,
+        out: &mut Vec<(EntryRecord, PathBuf)>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let mut seen = HashMap::<EntryId, PathBuf>::new();
+        while let Some((record, path)) = stack.pop() {
+            cancellation.checkpoint()?;
+            validate_component(&record.name)?;
+            if record.id == ROOT_ID {
+                return Err(invalid("archive entry reuses the root ID"));
+            }
+            if let Some(previous) = seen.insert(record.id, path.clone()) {
+                return Err(invalid(format!(
+                    "archive entry ID {} occurs at both {} and {}",
+                    record.id,
+                    previous.display(),
+                    path.display()
+                )));
+            }
+            let recurse = record.kind == EntryKind::Directory;
+            let id = record.id;
+            out.push((record, path.clone()));
+            if recurse {
+                self.push_children(id, path, &mut stack, cancellation)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn push_children(
+        &mut self,
+        parent: EntryId,
+        path: PathBuf,
+        stack: &mut Vec<(EntryRecord, PathBuf)>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let mut children = Vec::new();
         let mut cursor = None;
         loop {
             let page = self.index.children(parent, cursor, 1024)?;
             for record in page.entries {
                 cancellation.checkpoint()?;
+                if record.parent_id != parent {
+                    return Err(invalid("index child has the wrong parent ID"));
+                }
+                validate_component(&record.name)?;
                 let child_path = path.join(&record.name);
-                self.collect_record(record, child_path, out, cancellation)?;
+                children.push((record, child_path));
             }
             cursor = page.next;
             if cursor.is_none() {
+                children.reverse();
+                stack.extend(children);
                 return Ok(());
             }
         }
     }
+}
+
+fn preflight_capability(
+    walker: &mut DirWalker,
+    entries: &[(EntryRecord, PathBuf)],
+    overwrite: OverwritePolicy,
+) -> Result<()> {
+    let mut folded = std::collections::HashSet::new();
+    for (record, relative) in entries {
+        let text = relative
+            .to_str()
+            .ok_or_else(|| invalid_path(relative.display()))?;
+        if !folded.insert(text.to_lowercase()) {
+            return Err(invalid_path(format!(
+                "case-insensitive path collision: {text}"
+            )));
+        }
+        let (parent_path, name) = split_parent_name(relative)?;
+        let parent = match walker.existing_directory(parent_path)? {
+            Some(parent) => parent,
+            None => continue,
+        };
+        match symlink_metadata_at(parent, name) {
+            Ok(metadata) => {
+                let allowed = overwrite == OverwritePolicy::ReplaceFiles
+                    && ((record.kind == EntryKind::File && metadata.is_file())
+                        || (record.kind == EntryKind::Directory && metadata.is_dir()));
+                if !allowed {
+                    return Err(crate::error::message(format!(
+                        "target already exists: {}",
+                        relative.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn selection_output_path(path: &str, preserve_hierarchy: bool) -> Result<PathBuf> {
